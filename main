@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import time
+import sys
+import pandas as pd
+import numpy as np
+import matplotlib.pylab as plt
+import ftplib
+import os
+import shutil
+import sched
+import datetime
+
+from functools import reduce
+from influxdb import DataFrameClient
+from time import strftime
+
+import fnmatch #fn match
+import smtplib #for email
+import ssl #for email
+from datetime import datetime #datetime
+from termcolor import colored #for colouring text
+from email.mime.text import MIMEText # creates string for email
+from shutil import copyfile # for copying files
+import sys
+
+
+print("Packages imported")
+print("\n")
+
+while True:
+    for attempt in range(10):
+        try:
+            print("===========================================================================================================")
+            print("Data to influxdb initiated - ", strftime("%Y-%m-%d %H:%M:%S"))
+            print("===========================================================================================================")
+            # Ingest and cleanup
+            directory = "/directory/where/eltek/csv/are/located/" # edit
+            individual_files = "file1.csv", "file2.csv", "file3.csv", "etc.csv" # edit
+            # Create directory tuples
+            files = None
+            for full_name in individual_files:
+                original_dir = directory + full_name
+                if files is None:
+                    files = (original_dir,)
+                else:
+                    files = files + (original_dir,)
+            del full_name, original_dir, directory, individual_files
+            combined_data = None
+            for full_files in files:
+                #print(full_files)
+                temp_df = pd.read_csv(full_files, skiprows = 3, low_memory=False)
+                temp_df_cols = temp_df.columns.tolist()
+                for cols in temp_df_cols:
+                    #print(cols)
+                    temp_df[cols] = temp_df[cols].replace(['A','B','C','D','E','F','G','H','I','J'], ['temperature', 'humidity', 'co2', '1um', '25um', '100um', 'airflow', 'no2', 'co', 'voc']) # edit if csv files have different structure
+                temp_col_new_names = temp_df.iloc[0] + '_' + temp_df.iloc[1]
+                temp_col_new_names = temp_col_new_names.tolist()
+                temp_df.columns = temp_col_new_names
+                temp_df = temp_df.iloc[2:]
+                temp_df.rename(columns={'TX Serial Number_TX Channel': 'date'}, inplace=True)
+                temp_df['date'] = pd.to_datetime(temp_df['date'], errors='raise', dayfirst=True)
+                temp_df['date'] = temp_df['date'].dt.round('5min')
+                temp_df = temp_df.replace('No Data', np.nan) # No data to nan
+                temp_df = temp_df.replace('High', np.nan) # High to nan
+                temp_df = temp_df.replace('Low', np.nan) # Low to nan
+                temp_df = temp_df.replace('Open', np.nan) # Open to nan
+                print(full_files)
+                if combined_data is None:
+                    combined_data = temp_df
+                else:
+                    dfs = [combined_data, temp_df]
+                    combined_data = reduce(lambda left,right: pd.merge(left,right,on='date', how='outer'), dfs)
+            print("===================================")
+            print("IAQ Data ingested successfully")
+            pd.options.display.max_columns = None
+            pd.options.display.max_rows = None
+            cols = (combined_data.columns.tolist())
+            combined_data = combined_data.set_index(combined_data['date'])
+            combined_data = combined_data.apply(pd.to_numeric)
+            combined_data.isna().sum() # Calculate number of nans
+            combined_data = combined_data.interpolate(method ='linear', limit_direction ='forward') # Linear interpolation
+            combined_data.isna().sum() # Calculate number of nans
+            combined_data = combined_data.interpolate(method ='linear', limit_direction ='backward') # Linear interpolation
+            combined_data.isna().sum() # Calculate number of nans
+            combined_data['date']
+            cols = (combined_data.columns.tolist())
+            print("IAQ Data interpolated successfully")
+            print("===================================")
+            temperature = combined_data.filter(regex='temperature')
+            humidity = combined_data.filter(regex='humidity')
+            co2 = combined_data.filter(regex='co2')
+            um1 = combined_data.filter(regex='1um')
+            um25 = combined_data.filter(regex='25um')
+            um100 = combined_data.filter(regex='100um')
+            co = combined_data.filter(regex='co')
+            no2 = combined_data.filter(regex='no2')
+            voc = combined_data.filter(regex='voc')
+            print("===================================")
+            # ================================================================================================
+            print('Importing data to influxdb')
+            host='localhost' # edit host if required
+            port=8086 # edit port if required
+            user = 'database_username' # insert influxdb username
+            password = 'database_password' # insert influxdb password
+            dbname = 'database_name' # insert influxdb database name
+            protocol = 'line'
+            print('InfluxDB client instantiated')
+            client = DataFrameClient(host, port, user, password, dbname)
+            # Drop db
+            print("Delete database: " + dbname)
+            client.drop_database('database_name') # insert database name
+            # CReate DB
+            print("Create database: " + dbname)
+            client.create_database(dbname)
+            # Write DF to influxdb
+            print("Write DataFrame to influxdb - temperature")
+            client.write_points(temperature, 'temperature', protocol=protocol)
+            print("Write DataFrame to influxdb - humidity")
+            client.write_points(humidity, 'humidity', protocol=protocol)
+            print("Write DataFrame to influxdb - CO2")
+            client.write_points(co2, 'co2', protocol=protocol)
+            print("Write DataFrame to influxdb - 1um")
+            client.write_points(um1, '1um', protocol=protocol)
+            print("Write DataFrame to influxdb - 25um")
+            client.write_points(um25, '25um', protocol=protocol)
+            print("Write DataFrame to influxdb - 100um")
+            client.write_points(um100, '100um', protocol=protocol)
+            print("Write DataFrame to influxdb - CO")
+            client.write_points(co, 'co', protocol=protocol)
+            print("Write DataFrame to influxdb - NO2")
+            client.write_points(no2, 'no2', protocol=protocol)
+            print("Write DataFrame to influxdb - VOC")
+            client.write_points(voc, 'VOC', protocol=protocol)
+            print('Session closed')
+            client.close()
+            print("===========================================================================================================")
+            print("Data to influxdb completed - ", strftime("%Y-%m-%d %H:%M:%S"))
+            print("===========================================================================================================")
+            print("\n")
+            for i in range(24,0,-1): # run every 24 hours. Sleep for an hour and write remaining hours to console
+                sys.stdout.write(str(i)+' ')
+                sys.stdout.flush()
+                time.sleep(3600)
+            clear = lambda: os.system('clear')
+            clear()
+            break
+        except IOError as e:
+            print("Error", e, ' retrying')
+    else:
+        print('Too many errors - 10no!')
+        break
